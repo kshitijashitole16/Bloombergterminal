@@ -63,6 +63,25 @@ function makeSeries({ start = 450, points = 60, volatility = 0.5, drift = 0.04, 
   return out;
 }
 
+function makeDailySeries({ start = 450, days = 180, volatility = 1.8, drift = 0.02, seed = 0 }) {
+  let s = (seed || 1) % 2147483647;
+  const rnd = () => (s = (s * 48271) % 2147483647) / 2147483647;
+
+  const out = [];
+  let v = start;
+  const now = new Date();
+  for (let i = days - 1; i >= 0; i -= 1) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    v = Math.max(1, v + (rnd() - 0.5) * volatility + drift);
+    out.push({
+      date: d.toISOString().slice(0, 10),
+      close: Number(v.toFixed(2))
+    });
+  }
+  return out;
+}
+
 export function getWatchlist() {
   return WATCHLIST;
 }
@@ -100,6 +119,21 @@ export function getChart(symbol, points = 90) {
     volatility: Math.max(0.2, Math.abs(q.chg) * 0.4),
     drift: q.chg >= 0 ? 0.06 : -0.03,
     seed: s.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0)
+  });
+}
+
+export function getDailyHistory(symbol, months = 6) {
+  const s = String(symbol || '').toUpperCase();
+  const q = getQuote(s);
+  if (!q) return null;
+  const base = q.prev || q.last;
+  const days = Math.max(20, Math.floor(Number(months || 6) * 30));
+  return makeDailySeries({
+    start: base,
+    days,
+    volatility: Math.max(0.6, Math.abs(q.chg) * 0.9),
+    drift: q.chg >= 0 ? 0.08 : -0.04,
+    seed: s.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0) + 42
   });
 }
 

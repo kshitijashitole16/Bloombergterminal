@@ -73,6 +73,32 @@ export async function finnhubCandles(symbol, points = 90) {
   });
 }
 
+export async function finnhubDailyHistory(symbol, { months = 6 } = {}) {
+  const { token, enabled } = finnhubConfig();
+  if (!enabled) return null;
+  const s = String(symbol || '').toUpperCase();
+
+  const to = Math.floor(Date.now() / 1000);
+  const from = to - Math.max(1, Number(months) || 6) * 30 * 24 * 60 * 60;
+
+  const c = await finnhubGet('/stock/candle', token, {
+    symbol: s,
+    resolution: 'D',
+    from,
+    to,
+  });
+
+  if (!c || c.s !== 'ok' || !Array.isArray(c.c) || !Array.isArray(c.t)) return [];
+
+  return c.t.map((ts, i) => {
+    const d = new Date(ts * 1000);
+    return {
+      date: d.toISOString().slice(0, 10),
+      close: Number(c.c[i].toFixed(2)),
+    };
+  });
+}
+
 export async function finnhubCompanyNews(symbol) {
   const { token, enabled } = finnhubConfig();
   if (!enabled) return null;

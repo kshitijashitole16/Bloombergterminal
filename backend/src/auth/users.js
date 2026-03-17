@@ -21,6 +21,39 @@ export async function getUsers() {
   return cached;
 }
 
+export async function createUser({ email, password }) {
+  const e = String(email || '').trim().toLowerCase();
+  const p = String(password || '');
+  if (!e || !p) {
+    const err = new Error('missing_fields');
+    err.code = 'missing_fields';
+    throw err;
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) {
+    const err = new Error('invalid_email');
+    err.code = 'invalid_email';
+    throw err;
+  }
+  if (p.length < 4) {
+    const err = new Error('weak_password');
+    err.code = 'weak_password';
+    throw err;
+  }
+
+  const users = await getUsers();
+  if (users.some((u) => u.email === e)) {
+    const err = new Error('email_exists');
+    err.code = 'email_exists';
+    throw err;
+  }
+
+  const passwordHash = await bcrypt.hash(p, 10);
+  const id = `user:${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const record = { id, email: e, passwordHash };
+  users.push(record);
+  return { id: record.id, email: record.email };
+}
+
 export async function verifyEmailPassword(email, password) {
   const e = String(email || '').trim().toLowerCase();
   const p = String(password || '');
