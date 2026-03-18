@@ -3,22 +3,36 @@ import cors from 'cors';
 import http from 'http';
 import WebSocket, { WebSocketServer } from 'ws';
 import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { getBearerToken, signToken, verifyToken } from './auth/jwt.js';
-import { verifyEmailPassword } from './auth/users.js';
+import { createUser, verifyEmailPassword } from './auth/users.js';
 import { OAuth2Client } from 'google-auth-library';
+import { aiChatAnswer, aiMarketSummary } from './ai/openai.js';
+import { geminiChatAnswer, geminiMarketSummary } from './ai/gemini.js';
 import {
   getChart as mockChart,
+  getDailyHistory as mockDailyHistory,
   getNews as mockNews,
   getQuote as mockQuote,
   getWatchlist as mockWatchlist,
   isKnownSymbol,
 } from './data/mock.js';
-import { finnhubCandles, finnhubCompanyNews, finnhubConfig, finnhubQuote } from './providers/finnhub.js';
+import {
+  finnhubCandles,
+  finnhubCompanyNews,
+  finnhubConfig,
+  finnhubDailyHistory,
+  finnhubQuote,
+} from './providers/finnhub.js';
 import { createMockStreamer } from './realtime/mockStream.js';
 
 const app = express();
 
-dotenv.config();
+// Always load backend/.env regardless of current working directory
+dotenv.config({
+  path: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.env'),
+});
 app.use(cors());
 app.use(express.json());
 
@@ -35,6 +49,21 @@ app.post('/api/auth/login', (req, res) => {
     const token = signToken({ sub: user.id, email: user.email });
     return res.json({ token, user });
   })().catch(() => res.status(500).json({ error: 'server_error' }));
+});
+
+app.post('/api/auth/signup', (req, res) => {
+  (async () => {
+    const { email, password } = req.body || {};
+    const user = await createUser({ email, password });
+    return res.status(201).json({ user });
+  })().catch((e) => {
+    const code = e?.code || '';
+    if (code === 'email_exists') return res.status(409).json({ error: 'email_exists' });
+    if (code === 'invalid_email') return res.status(400).json({ error: 'invalid_email' });
+    if (code === 'weak_password') return res.status(400).json({ error: 'weak_password' });
+    if (code === 'missing_fields') return res.status(400).json({ error: 'missing_fields' });
+    return res.status(500).json({ error: 'server_error' });
+  });
 });
 
 app.post('/api/auth/google', (req, res) => {
@@ -173,6 +202,118 @@ app.get('/api/news/:symbol?', (req, res) => {
       res.json({ data: mockNews(symbol), source: 'mock' });
     }
   })();
+});
+
+app.get('/api/ai/summary/:symbol', (req, res) => {
+  const symbol = String(req.params.symbol || '').toUpperCase();
+  (async () => {
+    // Build context from existing providers (all authed already via /api middleware)
+    const quote = (await finnhubQuote(symbol).catch(() => null)) ?? mockQuote(symbol);
+    const news = (await finnhubCompanyNews(symbol).catch(() => null)) ?? mockNews(symbol);
+    const history =
+      (await finnhubDailyHistory(symbol, { months: 6 }).catch(() => null)) ?? mockDailyHistory(symbol, 6);
+    const historyStats = computeHistoryStats(history);
+
+    let text = null;
+    try {
+      text =
+        (await geminiMarketSummary({ symbol, quote, news, historyStats }).catch(() => null)) ??
+        (await aiMarketSummary({ symbol, quote, news, historyStats }).catch(() => null));
+    } catch (e) {
+      const status = e?.status ? ` (OpenAI ${e.status})` : '';
+      text = `AI request failed${status}. Check OPENAI_API_KEY/OPENAI_MODEL and restart backend.`;
+    }
+    if (!text) {
+      text =
+        `${symbol} is showing a ${(quote?.chg ?? 0) >= 0 ? 'positive' : 'negative'} move. ` +
+        `Set GEMINI_API_KEY (AIza...) or OPENAI_API_KEY (sk-...) in backend/.env and restart the backend.`;
+    }
+
+    res.json({
+      data: { symbol, text },
+      source: text.includes('Set GEMINI_API_KEY') ? 'mock' : 'ai',
+    });
+  })().catch(() => res.status(500).json({ error: 'server_error' }));
+});
+
+function computeHistoryStats(history) {
+  if (!Array.isArray(history) || history.length < 10) return null;
+  const closes = history.map((p) => Number(p.close)).filter((x) => Number.isFinite(x));
+  if (closes.length < 10) return null;
+
+  const first = closes[0];
+  const last = closes[closes.length - 1];
+  const retPct = first ? ((last - first) / first) * 100 : null;
+
+  const rets = [];
+  for (let i = 1; i < closes.length; i += 1) {
+    const prev = closes[i - 1];
+    const cur = closes[i];
+    if (!prev) continue;
+    rets.push((cur - prev) / prev);
+  }
+  const mean = rets.reduce((a, b) => a + b, 0) / (rets.length || 1);
+  const variance =
+    rets.reduce((a, r) => a + (r - mean) * (r - mean), 0) / Math.max(1, rets.length - 1);
+  const dailyVol = Math.sqrt(Math.max(0, variance));
+  const annVol = dailyVol * Math.sqrt(252);
+
+  let peak = closes[0];
+  let maxDd = 0;
+  for (const c of closes) {
+    if (c > peak) peak = c;
+    const dd = peak ? (c - peak) / peak : 0;
+    if (dd < maxDd) maxDd = dd;
+  }
+
+  return {
+    points: closes.length,
+    start: Number(first.toFixed(2)),
+    end: Number(last.toFixed(2)),
+    returnPct: retPct == null ? null : Number(retPct.toFixed(2)),
+    annVolPct: Number((annVol * 100).toFixed(2)),
+    maxDrawdownPct: Number((maxDd * 100).toFixed(2)),
+  };
+}
+
+app.post('/api/ai/chat', (req, res) => {
+  (async () => {
+    const { symbol, question, history } = req.body || {};
+    const s = String(symbol || '').toUpperCase();
+    const qText = String(question || '').trim();
+    if (!s || !/^[A-Z.-]{1,10}$/.test(s)) return res.status(400).json({ error: 'invalid_symbol' });
+    if (!qText) return res.status(400).json({ error: 'missing_question' });
+
+    const quote = (await finnhubQuote(s).catch(() => null)) ?? mockQuote(s);
+    const news = (await finnhubCompanyNews(s).catch(() => null)) ?? mockNews(s);
+
+    let answer = null;
+    try {
+      answer =
+        (await geminiChatAnswer({
+          symbol: s,
+          quote,
+          news,
+          question: qText,
+          history: Array.isArray(history) ? history : [],
+        }).catch(() => null)) ??
+        (await aiChatAnswer({
+          symbol: s,
+          quote,
+          news,
+          question: qText,
+          history: Array.isArray(history) ? history : [],
+        }).catch(() => null));
+    } catch (e) {
+      const status = e?.status ? `AI ${e.status}` : 'AI error';
+      answer = `${status}. Check GEMINI_API_KEY/OPENAI_API_KEY and restart backend.`;
+    }
+    if (!answer) {
+      answer = `AI is not configured. Set GEMINI_API_KEY (AIza...) or OPENAI_API_KEY (sk-...) in backend/.env and restart the backend.`;
+    }
+
+    res.json({ data: { symbol: s, answer }, source: answer.includes('Set GEMINI_API_KEY') ? 'mock' : 'ai' });
+  })().catch(() => res.status(500).json({ error: 'server_error' }));
 });
 
 const port = Number(process.env.PORT || 4000);
