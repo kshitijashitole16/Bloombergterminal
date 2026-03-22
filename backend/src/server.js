@@ -6,8 +6,9 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getBearerToken, signToken, verifyToken } from './auth/jwt.js';
-import { createUser, verifyEmailPassword } from './auth/users.js';
-import { OAuth2Client } from 'google-auth-library';
+import { findOrCreateUserByEmail } from './auth/users.js';
+import { requestOtp, verifyOtpCode } from './auth/otp.js';
+import { sendOtpEmail } from './auth/mail.js';
 import { aiChatAnswer, aiMarketSummary } from './ai/openai.js';
 import { geminiChatAnswer, geminiMarketSummary } from './ai/gemini.js';
 import {
@@ -26,6 +27,7 @@ import {
   finnhubQuote,
 } from './providers/finnhub.js';
 import { createMockStreamer } from './realtime/mockStream.js';
+import { computeDerivativesPayload } from './derivatives/calculator.js';
 
 const app = express();
 
@@ -36,53 +38,67 @@ dotenv.config({
 app.use(cors());
 app.use(express.json());
 
-const googleClientId = process.env.GOOGLE_CLIENT_ID || '';
-const googleClient = googleClientId ? new OAuth2Client(googleClientId) : null;
-
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-app.post('/api/auth/login', (req, res) => {
+function shouldExposeOtpInResponse() {
+  if (process.env.OTP_DEBUG === '0') return false;
+  if (process.env.OTP_DEBUG === '1') return true;
+  return process.env.NODE_ENV !== 'production';
+}
+
+/** Send 6-digit OTP (optional SMTP), logs to console, dev may expose in JSON. */
+app.post('/api/auth/request-otp', (req, res) => {
   (async () => {
-    const { email, password } = req.body || {};
-    const user = await verifyEmailPassword(email, password);
-    if (!user) return res.status(401).json({ error: 'invalid_credentials' });
-    const token = signToken({ sub: user.id, email: user.email });
-    return res.json({ token, user });
+    const { email } = req.body || {};
+    try {
+      const r = requestOtp(email);
+      let mailStatus = { sent: false };
+      try {
+        mailStatus = await sendOtpEmail(r.email, r.code);
+      } catch (mailErr) {
+        // eslint-disable-next-line no-console
+        console.warn('[OTP] Email send failed:', mailErr?.message || mailErr);
+        mailStatus = { sent: false, error: 'mail_failed' };
+      }
+
+      const expose = shouldExposeOtpInResponse();
+      const payload = {
+        ok: true,
+        /** True only when Resend or SMTP actually sent mail. */
+        emailSent: mailStatus.sent,
+        /**
+         * `emailSent` false does NOT mean OTP failed — it means no mail provider is configured.
+         * The code is still in `devOtp` (dev) or only in server logs (production without email).
+         */
+        otpDelivery: mailStatus.sent ? 'email' : expose ? 'dev_response' : 'console_only',
+        note: mailStatus.sent
+          ? 'Check your inbox for the 6-digit code.'
+          : expose
+            ? 'No email sent (add RESEND_API_KEY or SMTP_* in backend/.env). Use devOtp below or the server terminal.'
+            : 'OTP was not included in this response. Check the backend terminal, or set OTP_DEBUG=1 / configure email.',
+      };
+      if (expose) payload.devOtp = r.code;
+      return res.json(payload);
+    } catch (e) {
+      if (e.code === 'invalid_email') return res.status(400).json({ error: 'invalid_email' });
+      if (e.code === 'rate_limited') {
+        return res.status(429).json({ error: 'rate_limited', retryAfterSec: e.retryAfterSec });
+      }
+      throw e;
+    }
   })().catch(() => res.status(500).json({ error: 'server_error' }));
 });
 
-app.post('/api/auth/signup', (req, res) => {
+app.post('/api/auth/verify-otp', (req, res) => {
   (async () => {
-    const { email, password } = req.body || {};
-    const user = await createUser({ email, password });
-    return res.status(201).json({ user });
-  })().catch((e) => {
-    const code = e?.code || '';
-    if (code === 'email_exists') return res.status(409).json({ error: 'email_exists' });
-    if (code === 'invalid_email') return res.status(400).json({ error: 'invalid_email' });
-    if (code === 'weak_password') return res.status(400).json({ error: 'weak_password' });
-    if (code === 'missing_fields') return res.status(400).json({ error: 'missing_fields' });
-    return res.status(500).json({ error: 'server_error' });
-  });
-});
-
-app.post('/api/auth/google', (req, res) => {
-  (async () => {
-    if (!googleClient) return res.status(500).json({ error: 'google_not_configured' });
-    const { idToken } = req.body || {};
-    if (!idToken) return res.status(400).json({ error: 'missing_id_token' });
-
-    const ticket = await googleClient.verifyIdToken({
-      idToken: String(idToken),
-      audience: googleClientId,
-    });
-    const payload = ticket.getPayload();
-    if (!payload?.sub || !payload?.email) return res.status(401).json({ error: 'invalid_google_token' });
-
-    const user = { id: `google:${payload.sub}`, email: payload.email };
+    const { email, otp } = req.body || {};
+    const v = verifyOtpCode(email, otp);
+    if (v === null) return res.status(401).json({ error: 'otp_expired_or_missing' });
+    if (v === false) return res.status(401).json({ error: 'invalid_otp' });
+    const user = await findOrCreateUserByEmail(email);
     const token = signToken({ sub: user.id, email: user.email });
     return res.json({ token, user });
-  })().catch(() => res.status(401).json({ error: 'invalid_google_token' }));
+  })().catch(() => res.status(500).json({ error: 'server_error' }));
 });
 
 function requireAuth(req, res, next) {
@@ -190,6 +206,40 @@ app.get('/api/chart/:symbol', (req, res) => {
       res.json({ data: mockChart(symbol, points), source: 'mock' });
     }
   })();
+});
+
+/** Futures fair value + Black–Scholes call/put using ~1y daily history for σ (Finnhub or mock). */
+app.get('/api/derivatives/calculator', (req, res) => {
+  (async () => {
+    const symbol = String(req.query.symbol || 'SPY').toUpperCase();
+    const strike = Number(req.query.strike || 0);
+    const daysToExpiry = Math.max(1, Math.min(3650, Number(req.query.daysToExpiry || 30)));
+    const r = Number(req.query.r ?? 0.05);
+    const q = Number(req.query.q ?? 0);
+    const fhHist = await finnhubDailyHistory(symbol, { months: 12 }).catch(() => null);
+    const useFh =
+      finnhubConfig().enabled && Array.isArray(fhHist) && fhHist.length >= 20;
+    let history = useFh ? fhHist : (mockDailyHistory(symbol, 12) ?? []);
+    if (!Array.isArray(history)) history = [];
+    const liveQuote = await finnhubQuote(symbol).catch(() => null);
+    const quote = liveQuote ?? mockQuote(symbol);
+    if (!quote || !Number.isFinite(Number(quote.last)) || Number(quote.last) <= 0) {
+      return res.status(404).json({ error: 'unknown_symbol' });
+    }
+    const spot = Number(quote.last);
+    const data = computeDerivativesPayload({
+      history,
+      spot,
+      strike,
+      daysToExpiry,
+      r,
+      q,
+    });
+    data.symbol = symbol;
+    data.quoteSource = liveQuote ? 'finnhub' : 'mock';
+    data.historySource = useFh ? 'finnhub_daily_12m' : 'mock_daily_12m';
+    res.json({ data });
+  })().catch(() => res.status(500).json({ error: 'server_error' }));
 });
 
 app.get('/api/news/:symbol?', (req, res) => {

@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 
 function demoUserFromEnv() {
@@ -63,5 +64,22 @@ export async function verifyEmailPassword(email, password) {
   const ok = await bcrypt.compare(p, u.passwordHash);
   if (!ok) return null;
   return { id: u.id, email: u.email };
+}
+
+/** OTP login: find existing user or create one with a random password hash (never used for OTP). */
+export async function findOrCreateUserByEmail(email) {
+  const e = String(email || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) {
+    const err = new Error('invalid_email');
+    err.code = 'invalid_email';
+    throw err;
+  }
+  const users = await getUsers();
+  const existing = users.find((u) => u.email === e);
+  if (existing) return { id: existing.id, email: existing.email };
+  const passwordHash = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
+  const id = `user:${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  users.push({ id, email: e, passwordHash });
+  return { id, email: e };
 }
 
